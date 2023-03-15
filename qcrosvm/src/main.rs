@@ -1395,6 +1395,7 @@ fn set_argument(cfg: &mut BackendConfig, name: &str, value: Option<&str>) -> arg
 	"net" => {
 		let param = value.unwrap();
 		let mut components = param.split(',');
+		let network_dev = components.next();
 		cfg.network_dev = true;
 
 		let mut vnet_dev = VirtioNet {
@@ -1432,6 +1433,58 @@ fn set_argument(cfg: &mut BackendConfig, name: &str, value: Option<&str>) -> arg
 					vnet_dev.label = label;
 				}
 
+				"ip_addr" => {
+					if cfg.ip_addr.is_some() {
+						return Err(argument::Error::TooManyArguments(
+							"`host_ip` already given".to_owned(),
+						));
+					}
+					cfg.ip_addr =
+						Some(
+							value
+							.parse()
+							.map_err(|_| argument::Error::InvalidValue {
+								value: value.to_owned(),
+								expected: String::from("`ip_addr` needs to be in the form \"x.x.x.x\""),
+							})?,
+						);
+				}
+
+				"netmask" => {
+						if cfg.netmask.is_some() {
+							return Err(argument::Error::TooManyArguments(
+								"`netmask` already given".to_owned(),
+							));
+						}
+						cfg.netmask =
+							Some(
+								value
+									.parse()
+									.map_err(|_| argument::Error::InvalidValue {
+										value: value.to_owned(),
+										expected: String::from("`netmask` needs to be in the form \"x.x.x.x\""),
+									})?,
+							);
+					}
+					"mac" => {
+						if cfg.mac_addr.is_some() {
+							return Err(argument::Error::TooManyArguments(
+								"`mac` already given".to_owned(),
+							));
+						}
+						cfg.mac_addr =
+							Some(
+								value
+									.parse()
+									.map_err(|_| argument::Error::InvalidValue {
+										value: value.to_owned(),
+										expected: String::from(
+											"`mac` needs to be in the form \"XX:XX:XX:XX:XX:XX\"",
+										),
+									})?,
+							);
+					}
+
 				_ => {
 					return Err(argument::Error::InvalidValue {
 						value: kind.to_owned(),
@@ -1444,60 +1497,6 @@ fn set_argument(cfg: &mut BackendConfig, name: &str, value: Option<&str>) -> arg
 		cfg.vnet.push(vnet_dev);
 	}
 
-	"ip_addr" => {
-		if cfg.ip_addr.is_some() {
-			return Err(argument::Error::TooManyArguments(
-				"`host_ip` already given".to_owned(),
-			));
-		}
-		cfg.ip_addr =
-			Some(
-				value
-				.unwrap()
-				.parse()
-				.map_err(|_| argument::Error::InvalidValue {
-					value: value.unwrap().to_owned(),
-					expected: String::from("`ip_addr` needs to be in the form \"x.x.x.x\""),
-				})?,
-			);
-	}
-
-	"netmask" => {
-            if cfg.netmask.is_some() {
-                return Err(argument::Error::TooManyArguments(
-                    "`netmask` already given".to_owned(),
-                ));
-            }
-            cfg.netmask =
-                Some(
-                    value
-                        .unwrap()
-                        .parse()
-                        .map_err(|_| argument::Error::InvalidValue {
-                            value: value.unwrap().to_owned(),
-                            expected: String::from("`netmask` needs to be in the form \"x.x.x.x\""),
-                        })?,
-                );
-        }
-        "mac" => {
-            if cfg.mac_addr.is_some() {
-                return Err(argument::Error::TooManyArguments(
-                    "`mac` already given".to_owned(),
-                ));
-            }
-            cfg.mac_addr =
-                Some(
-                    value
-                        .unwrap()
-                        .parse()
-                        .map_err(|_| argument::Error::InvalidValue {
-                            value: value.unwrap().to_owned(),
-                            expected: String::from(
-                                "`mac` needs to be in the form \"XX:XX:XX:XX:XX:XX\"",
-                            ),
-                        })?,
-                );
-        }
 	_ => unreachable!(),
 
 	}
@@ -1521,10 +1520,12 @@ fn parse_and_run(args: std::env::Args) -> std::result::Result<(), ()> {
 			Argument::short_value('v', "vm", "VMNAME", "Virtual Machine Name"),
 			Argument::short_flag('s', "sandbox", "Sandbox using minijail (default: disabled."),
 
-			Argument::short_value('n',"net","label=LABEL[,key=value[,...]]","net device label=LABEL - Indicates the label associated with the virtual net dev "),
-			Argument::value("ip_addr", "IP", "IP address to assign to host tap interface."),
-			Argument::value("netmask", "NETMASK", "Netmask for VM subnet."),
-			Argument::value("mac", "MAC", "MAC address for VM."),
+			Argument::short_value('n',"net","label=LABEL[,key=value[,key=value[,...]]]","net device followed by comma-separated options.
+            Valid keys:
+			label=LABEL - Indicates the label associated with the virtual net dev
+			ip_addr=IP - IP address to assign to host tap interface
+			netmask=NETMASK - Netmask for VM subnet
+			mac=MAC - MAC address for VM"),
 		];
 	let mut cfg = BackendConfig::default();
 	let match_res = set_arguments(args, &arguments[..], |name, value| {
