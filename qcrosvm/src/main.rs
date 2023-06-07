@@ -25,9 +25,10 @@ use simplelog::*;
 extern crate android_logger;
 use libc::{self, c_uint, c_int, c_char, open, O_RDWR, O_WRONLY};
 
-use devices::virtio::{self, base_features, Block, Net};
+use devices::virtio::{self, base_features, Block, Net, VirtioDevice};
 use hypervisor::{ProtectionType};
 use mmio::MmioDevice;
+use devices::virtio::vhost::Scmi;
 
 use base::{pagesize, AsRawDescriptor};
 use vm_memory::{GuestAddress, GuestMemory, GuestMemoryError, MemoryRegion};
@@ -59,6 +60,8 @@ use minijail::Minijail;
 static GH_PATH: &str = "/dev/gunyah";
 static VIRTIO_BE_PATH: &str = "/dev/gh_virtio_backend_";
 static TRACE_MARKER: &str = "/sys/kernel/debug/tracing/trace_marker";
+static VHOST_SCMI_PATH: &str = "/dev/vhost-scmi";
+
 // Todo: Use UAPI header files
 const ASSIGN_EVENTFD: u32 = 1;
 const GH_IOCTL_TYPE_V2: u32 = 0xB2;
@@ -139,6 +142,13 @@ struct Vcpu {
 	thread_handle: Option<JoinHandle<()>>,
 }
 
+struct ScmiDevice {
+    enable: bool,
+    label: u32,
+    mmio: Option<MmioDevice>,
+    config_space: Option<Vec<u32>>,
+}
+
 /// Aggregate of all configurable options for a block device
 struct BackendConfig {
     sfd: Option<SafeDescriptor>,
@@ -150,6 +160,7 @@ struct BackendConfig {
     vcpus: Vec<Vcpu>,
     vcpu_count: u16,
     driver_variant: u8,
+    scmi: ScmiDevice,
     sandbox: bool,
     log_level: LevelFilter,
     network_dev: bool,
@@ -174,6 +185,12 @@ impl Default for BackendConfig {
 	    vcpus: Vec::new(),
 	    vcpu_count: 1,
 	    driver_variant: 2,
+            scmi: ScmiDevice {
+		enable: false,
+		label: 0,
+		mmio: None,
+		config_space: None,
+		},
             sandbox: false,
             log_level: log::LevelFilter::Info,
             network_dev: false,
@@ -355,7 +372,7 @@ fn to_cmd(ioc: VmIoctl, version: u8) -> std::result::Result<u64, BackendError> {
 }
 
 fn print_usage() {
-    println!("qcrosvm [-l] [-s] [--disk=IMAGE_FILE,label=LABEL[,rw=[true|false],sparse=[true|false],block_size=BYTES]] --vm=VMNAME");
+    println!("qcrosvm [-l] [-s] [-c | --scmi=label=LABEL] [--disk=IMAGE_FILE,label=LABEL[,rw=[true|false],sparse=[true|false],block_size=BYTES]] --vm=VMNAME");
     println!("\n[-l] or [--log=[level=trace|debug|info|warn|error],[type=ftrace|logcat|term]]");
     println!("Default logger level: info");
     println!("Default logger type: ftrace");
@@ -580,6 +597,65 @@ fn create_block_devices(cfg: &mut BackendConfig) -> std::result::Result<(), Back
     Ok(())
 }
 
+fn create_vhost_scmi_device(_mem: &GuestMemory) -> std::result::Result<Box<Scmi>, BackendError> {
+	let features :u64 = base_features(ProtectionType::Unprotected);
+	let vhost_scmi_dev_path = PathBuf::from(VHOST_SCMI_PATH);
+	let dev = virtio::vhost::Scmi::new(&vhost_scmi_dev_path, features)
+			.map_err(|_| BackendError::StrError(String::from("virtio scmi new failed")))?;
+	Ok(Box::new(dev))
+}
+
+fn create_scmi_device(cfg: &mut BackendConfig) -> std::result::Result<(), BackendError> {
+        let mem = cfg.mem.as_ref().unwrap();
+	let scmidev = create_vhost_scmi_device(mem)?;
+	let sfd :&SafeDescriptor;
+	match cfg.driver_variant {
+		1 => {sfd = cfg.sfd.as_ref().expect(&format!("{}:{}", file!(), line!()));}
+		2 => {sfd = cfg.vm_sfd.as_ref().expect(&format!("{}:{}", file!(), line!()));}
+		_ => return Err(BackendError::StrError(String::from("Unsupported driver variant.")))
+	};
+
+        cfg.scmi.mmio = Some(MmioDevice::new(mem.clone(), scmidev as Box<dyn VirtioDevice>).unwrap());
+        let mut idx = 0;
+        let mmio = cfg.scmi.mmio.as_ref().unwrap();
+        for e in mmio.queue_evts() {
+            let event_fd = VirtioEventfd {
+                _label : cfg.scmi.label,
+                _flags : ASSIGN_EVENTFD,
+                _queue_num : idx,
+                _fd : e.as_raw_descriptor(),
+            };
+
+            idx = idx + 1;
+            let ret = unsafe { ioctl_with_ref(sfd, to_cmd(VmIoctl::IoEventFd, cfg.driver_variant)
+								.expect(&format!("{}:{}", file!(), line!())), &event_fd) };
+            if ret < 0 {
+                return Err(BackendError::StrNumError {
+                   err: String::from("ioeventfd ioctl failed"),
+                   val: io::Error::last_os_error(),
+                });
+            }
+        }
+
+        let irq_fd = VirtioIrqfd {
+            _label: cfg.scmi.label,
+            _fd : mmio.interrupt_evt().unwrap().as_raw_descriptor(),
+            _flags: VBE_ASSIGN_IRQFD,
+            _reserved: 0,
+        };
+
+        let ret = unsafe { ioctl_with_ref(sfd, to_cmd(VmIoctl::IrqFd, cfg.driver_variant)
+		                   .expect(&format!("{}:{}", file!(), line!())), &irq_fd) };
+        if ret < 0 {
+            return Err(BackendError::StrNumError {
+                err: String::from("irqfd ioctl failed"),
+                val: io::Error::last_os_error(),
+            });
+        }
+
+    Ok(())
+}
+
 fn handle_driver_ok(label: u32, sfd: &SafeDescriptor, mmio: &mut MmioDevice, cspace: &mut Vec<u32>, driver_variant: u8) {
     let mut cdata = VirtioConfigData {
         _label: label,
@@ -633,44 +709,44 @@ fn handle_driver_ok(label: u32, sfd: &SafeDescriptor, mmio: &mut MmioDevice, csp
                 _queue_device: 0,
     };
 
-    let mut queue_addr: u32;
+        let mut queue_addr: u32;
 
-    let ret = unsafe { ioctl_with_mut_ref(sfd, to_cmd(VmIoctl::GetQueueInfo, driver_variant)
-	                   .expect(&format!("{}:{}", file!(), line!())), &mut qinfo)};
-    assert!(ret == 0, "{}:{}:ret={}, {}", file!(), line!(), ret, io::Error::last_os_error());
+        let ret = unsafe { ioctl_with_mut_ref(sfd, to_cmd(VmIoctl::GetQueueInfo, driver_variant)
+                               .expect(&format!("{}:{}", file!(), line!())), &mut qinfo)};
+        assert!(ret == 0, "{}:{}:ret={}, {}", file!(), line!(), ret, io::Error::last_os_error());
 
-    let bytes = qinfo._queue_sel.to_le_bytes();
-    mmio.write(VIRTIO_MMIO_QUEUE_SEL, &bytes);
+        let bytes = qinfo._queue_sel.to_le_bytes();
+        mmio.write(VIRTIO_MMIO_QUEUE_SEL, &bytes);
 
-    let bytes = qinfo._queue_num.to_le_bytes();
-    mmio.write(VIRTIO_MMIO_QUEUE_NUM, &bytes);
+        let bytes = qinfo._queue_num.to_le_bytes();
+        mmio.write(VIRTIO_MMIO_QUEUE_NUM, &bytes);
 
-    queue_addr = qinfo._queue_desc as u32;
-    let bytes = queue_addr.to_le_bytes();
-    mmio.write(VIRTIO_MMIO_QUEUE_DESC_LOW, &bytes);
+        queue_addr = qinfo._queue_desc as u32;
+        let bytes = queue_addr.to_le_bytes();
+        mmio.write(VIRTIO_MMIO_QUEUE_DESC_LOW, &bytes);
 
-    queue_addr = (qinfo._queue_desc >> 32) as u32;
-    let bytes = queue_addr.to_le_bytes();
-    mmio.write(VIRTIO_MMIO_QUEUE_DESC_HIGH, &bytes);
+        queue_addr = (qinfo._queue_desc >> 32) as u32;
+        let bytes = queue_addr.to_le_bytes();
+        mmio.write(VIRTIO_MMIO_QUEUE_DESC_HIGH, &bytes);
 
-    queue_addr = qinfo._queue_driver as u32;
-    let bytes = queue_addr.to_le_bytes();
-    mmio.write(VIRTIO_MMIO_QUEUE_AVAIL_LOW, &bytes);
+        queue_addr = qinfo._queue_driver as u32;
+        let bytes = queue_addr.to_le_bytes();
+        mmio.write(VIRTIO_MMIO_QUEUE_AVAIL_LOW, &bytes);
 
-    queue_addr = (qinfo._queue_driver >> 32) as u32;
-    let bytes = queue_addr.to_le_bytes();
-    mmio.write(VIRTIO_MMIO_QUEUE_AVAIL_HIGH, &bytes);
+        queue_addr = (qinfo._queue_driver >> 32) as u32;
+        let bytes = queue_addr.to_le_bytes();
+        mmio.write(VIRTIO_MMIO_QUEUE_AVAIL_HIGH, &bytes);
 
-    queue_addr = qinfo._queue_device as u32;
-    let bytes = queue_addr.to_le_bytes();
-    mmio.write(VIRTIO_MMIO_QUEUE_USED_LOW, &bytes);
+        queue_addr = qinfo._queue_device as u32;
+        let bytes = queue_addr.to_le_bytes();
+        mmio.write(VIRTIO_MMIO_QUEUE_USED_LOW, &bytes);
 
-    queue_addr = (qinfo._queue_device >> 32) as u32;
-    let bytes = queue_addr.to_le_bytes();
-    mmio.write(VIRTIO_MMIO_QUEUE_USED_HIGH, &bytes);
+        queue_addr = (qinfo._queue_device >> 32) as u32;
+        let bytes = queue_addr.to_le_bytes();
+        mmio.write(VIRTIO_MMIO_QUEUE_USED_HIGH, &bytes);
 
-    let bytes = qinfo._queue_ready.to_le_bytes();
-    mmio.write(VIRTIO_MMIO_QUEUE_READY, &bytes);
+        let bytes = qinfo._queue_ready.to_le_bytes();
+        mmio.write(VIRTIO_MMIO_QUEUE_READY, &bytes);
 
     }
     let bytes = cspace[VIRTIO_MMIO_STATUS_IDX as usize].to_le_bytes();
@@ -959,6 +1035,29 @@ fn run_backend_v2(cfg: &mut BackendConfig) -> std::result::Result<(), ()>
 			net_thread_handles.push(handle);
 		}
     }
+	let mut scmi_thread_handles = Vec::new();
+        if cfg.scmi.enable {
+                let scmi_err = create_scmi_device(cfg);
+
+                if let Err(_scmi_err) = scmi_err {
+                        error!("{}", _scmi_err);
+                        return Err(());
+                }
+
+                let label = cfg.scmi.label;
+                let mut sfd = cfg.vm_sfd.as_mut().expect(&format!("{}:{}", file!(), line!())).try_clone()
+                              .expect(&format!("{}:{}", file!(), line!()));
+                let mut mmio = cfg.scmi.mmio.take().unwrap();
+                let mut cspace = cfg.scmi.config_space.take().unwrap();
+                let driver_variant = cfg.driver_variant;
+                init_config_space(&mut cspace, label, &mut mmio, &mut sfd, driver_variant);
+
+                debug!("SCMI Thread being created");
+                let handle = thread::spawn(move || {
+                                handle_events(label, sfd, &mut mmio, &mut cspace, driver_variant);
+                                });
+				scmi_thread_handles.push(handle);
+        }
 
 	let e = create_vcpus(cfg);
 	if let Err(_e) = e {
@@ -986,6 +1085,11 @@ fn run_backend_v2(cfg: &mut BackendConfig) -> std::result::Result<(), ()>
 		}
 	}
 
+	if cfg.scmi.enable {
+		for handle in scmi_thread_handles {
+			let _ret = handle.join();
+		}
+	}
 	Ok(())
 }
 
@@ -1391,6 +1495,54 @@ fn set_argument(cfg: &mut BackendConfig, name: &str, value: Option<&str>) -> arg
 			}
 		}
         }
+        "scmi" => {
+                let mut scmi_label: u32 = 0;
+		let param = value.expect(&format!("{}:{}", file!(), line!()));
+		let components = param.split(',');
+		for opt in components {
+			let mut o = opt.splitn(2, '=');
+			let kind = o.next().ok_or_else(|| argument::Error::InvalidValue {
+				value: opt.to_owned(),
+				expected: String::from("scmi options must not be empty"),
+			})?;
+
+			let value = o.next().ok_or_else(|| argument::Error::InvalidValue {
+					value: opt.to_owned(),
+					expected: String::from("scmi options must be of the form `kind=value`"),
+				})?;
+
+			match kind {
+			"label" => {
+				let label: u32 = u32::from_str_radix(value, 16)
+					.map_err(|_| argument::Error::InvalidValue {
+						value: value.to_owned(),
+						expected: String::from("`label` must be an unsigned integer"),
+				})?;
+				if label == 0 {
+					return Err(argument::Error::InvalidValue {
+						value: value.to_owned(),
+						expected: String::from("`label` must be a non zero integer"),
+					});
+
+				}
+				scmi_label = label;
+			}
+
+			_ => {
+				return Err(argument::Error::InvalidValue {
+					value: kind.to_owned(),
+					expected: String::from("supported scmi options only"),
+				});
+                            }
+			}
+		}
+                cfg.scmi = ScmiDevice {
+                    enable: true,
+                    label: scmi_label,
+                    mmio: None,
+                    config_space: Some(Vec::new()),
+                };
+        }
 
 	"net" => {
 		let param = value.unwrap();
@@ -1519,6 +1671,9 @@ fn parse_and_run(args: std::env::Args) -> std::result::Result<(), ()> {
 			"Logging Configurations. Default level: info, Default type: ftrace"),
 			Argument::short_value('v', "vm", "VMNAME", "Virtual Machine Name"),
 			Argument::short_flag('s', "sandbox", "Sandbox using minijail (default: disabled."),
+			Argument::short_value('c', "scmi", "label=LABEL[,key=value[,key=value[,...]]", "Enable SCMI with the given label.
+			Valid keys:
+			label=LABEL - Indicates the label associated with the scmi virtio device"),
 
 			Argument::short_value('n',"net","label=LABEL[,key=value[,key=value[,...]]]","net device followed by comma-separated options.
             Valid keys:
